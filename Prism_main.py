@@ -10,12 +10,13 @@ from Config import *
 from Helper import *
 from typing import List, Dict
 from plot_drum_detection import *
-
+import os
 # For polyphonic transcription (Basic Pitch) on the "other" stem
 from basic_pitch.inference import predict_and_save
 from basic_pitch import ICASSP_2022_MODEL_PATH
 import numpy as np, librosa, scipy.signal as sig
 from typing import Optional
+import torchaudio
 
 # correctifs NumPy↔librosa (Py3.9)
 for attr, alias in [("complex", complex), ("float", float), ("int", int)]:
