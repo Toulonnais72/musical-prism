@@ -1,20 +1,25 @@
 import warnings
 warnings.filterwarnings("ignore")
 import threading
+import concurrent.futures
+import tempfile
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import pygame
+import time
 from demucs.pretrained import get_model
 from demucs.apply import apply_model
 from Config import *
 from Helper import *
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from plot_drum_detection import *
 import os
+import contextlib
 # For polyphonic transcription (Basic Pitch) on the "other" stem
-from basic_pitch.inference import predict_and_save
+from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
 import numpy as np, librosa, scipy.signal as sig
+import torch
 from typing import Optional
 import torchaudio
 
@@ -39,51 +44,222 @@ CLUSTER_THRESHOLD = 0.01  # Onsets under 10 ms apart are considered “simultane
 # BASIC PITCH => single pass on "other" stem
 ###############################################################################
 
-def transcribe_polyphonic_basic_pitch(audio_path, output_midi_path):
-    """
-    Calls Basic Pitch on 'audio_path', writes <basename>_basic_pitch.mid,
-    renames to 'output_midi_path'. Returns a list of instruments from that file.
-    """
-    out_dir = os.path.dirname(output_midi_path)
-    os.makedirs(out_dir, exist_ok=True)
-    base_filename = os.path.splitext(os.path.basename(audio_path))[0]
-    midi_filename = f"{base_filename}_other_poly.mid"
-    output_midi_path = os.path.join(out_dir, midi_filename)
-    # Ensure the output MIDI path is unique
-    if os.path.exists(output_midi_path):
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        unique_filename = f"{base_filename}_other_poly_{timestamp}.mid"
-        output_midi_path = os.path.join(out_dir, unique_filename)
 
-    mid_created = os.path.join(out_dir, f"{base_filename}_basic_pitch.mid")
-    if os.path.exists(mid_created):
-        os.remove(mid_created)
-    print("Notes detection on 'other instruments' using Basic Pitch (R)")
-    predict_and_save(
-        audio_path_list=[audio_path],
-        save_notes=False,
-        model_or_model_path=ICASSP_2022_MODEL_PATH,
-        output_directory=out_dir,
-        save_midi=True,
-        save_model_outputs=False,
-        sonify_midi=False
+def _basic_pitch_chunk_worker(args):
+    (
+        chunk_path,
+        model_path,
+        onset_threshold,
+        frame_threshold,
+        minimum_note_length_ms,
+        minimum_frequency,
+        maximum_frequency,
+        multiple_pitch_bends,
+        melodia_trick,
+        midi_tempo,
+    ) = args
+    _, midi_data, _ = predict(
+        chunk_path,
+        model_or_model_path=model_path,
+        onset_threshold=onset_threshold,
+        frame_threshold=frame_threshold,
+        minimum_note_length=minimum_note_length_ms,
+        minimum_frequency=minimum_frequency,
+        maximum_frequency=maximum_frequency,
+        multiple_pitch_bends=multiple_pitch_bends,
+        melodia_trick=melodia_trick,
+        midi_tempo=midi_tempo,
     )
+    payload = []
+    for instrument in midi_data.instruments:
+        for note in instrument.notes:
+            payload.append((float(note.start), float(note.end), int(note.pitch), int(note.velocity)))
+    return payload
 
-    # Check for the created MIDI file and rename it if necessary
-    mid_created = os.path.join(out_dir, f"{base_filename}_basic_pitch.mid")
-    if os.path.exists(mid_created):
-        # Ensure the final MIDI path is unique
-        if os.path.exists(output_midi_path):
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            unique_filename = f"{base_filename}_other_full_basic_pitch_{timestamp}.mid"
-            output_midi_path = os.path.join(out_dir, unique_filename)
-        os.rename(mid_created, output_midi_path)
 
-    instruments = []
-    if os.path.exists(output_midi_path):
-        pm_temp = pretty_midi.PrettyMIDI(output_midi_path)
-        instruments = pm_temp.instruments
-    return instruments
+def transcribe_polyphonic_basic_pitch(audio_path, output_midi_path, config=None):
+    """Run Basic Pitch on the provided audio file using chunked multiprocessing."""
+    if config is None:
+        config = {}
+
+    segment_sec = float(config.get("basic_pitch_segment_sec", 40.0))
+    segment_sec = max(30.0, min(45.0, segment_sec))
+    overlap_sec = float(config.get("basic_pitch_segment_overlap_sec", 2.0))
+    workers_cfg = config.get("basic_pitch_workers")
+    workers = max(1, int(workers_cfg)) if workers_cfg is not None else max(1, (os.cpu_count() or 1))
+    chorus_only = bool(config.get("basic_pitch_chorus_only", False))
+    chorus_rms_db = float(config.get("basic_pitch_chorus_rms_db", -35.0))
+    chorus_window_sec = float(config.get("basic_pitch_chorus_window_sec", 2.0))
+    onset_threshold = float(config.get("basic_pitch_onset_threshold", 0.5))
+    frame_threshold = float(config.get("basic_pitch_frame_threshold", 0.3))
+    min_note_length_ms = float(config.get("basic_pitch_min_note_length_ms", 127.7))
+    midi_tempo = float(config.get("basic_pitch_midi_tempo", 120.0))
+    min_freq = config.get("basic_pitch_min_freq")
+    max_freq = config.get("basic_pitch_max_freq")
+    multiple_pitch_bends = bool(config.get("basic_pitch_multiple_pitch_bends", False))
+    melodia_trick = bool(config.get("basic_pitch_melodia_trick", True))
+    model_path = config.get("basic_pitch_model_path", ICASSP_2022_MODEL_PATH)
+
+    os.makedirs(os.path.dirname(output_midi_path), exist_ok=True)
+
+    waveform, sr = torchaudio.load(audio_path)
+    waveform = waveform.to(torch.float32)
+    total_samples = waveform.shape[-1]
+    if total_samples == 0:
+        pm_empty = pretty_midi.PrettyMIDI()
+        pm_empty.write(output_midi_path)
+        return pm_empty.instruments
+
+    segment_samples = max(1, int(segment_sec * sr))
+    overlap_samples = max(0, int(overlap_sec * sr))
+    if overlap_samples >= segment_samples:
+        overlap_samples = segment_samples // 2
+
+    mono = waveform.mean(dim=0).numpy()
+    total_duration = total_samples / float(sr)
+
+    def build_segments_from_ranges(ranges):
+        segments_local = []
+        for start, end in ranges:
+            cursor = start
+            while cursor < end:
+                chunk_end = min(cursor + segment_samples, end)
+                if chunk_end <= cursor:
+                    break
+                segments_local.append((cursor, chunk_end))
+                if chunk_end == end:
+                    break
+                if overlap_samples:
+                    next_cursor = chunk_end - overlap_samples
+                    if next_cursor <= cursor:
+                        cursor = chunk_end
+                    else:
+                        cursor = next_cursor
+                else:
+                    cursor = chunk_end
+        return segments_local
+
+    def detect_loud_ranges():
+        window_samples = max(1, int(chorus_window_sec * sr))
+        hop_samples = max(1, window_samples // 2)
+        loud_ranges = []
+        current_start = None
+        current_end = None
+        for start in range(0, total_samples, hop_samples):
+            end = min(start + window_samples, total_samples)
+            frame = mono[start:end]
+            if frame.size == 0:
+                continue
+            rms = np.sqrt(np.mean(frame ** 2) + 1e-12)
+            db = 20.0 * np.log10(rms + 1e-12)
+            if db >= chorus_rms_db:
+                if current_start is None:
+                    current_start = start
+                current_end = end
+            else:
+                if current_start is not None:
+                    loud_ranges.append((current_start, current_end))
+                    current_start = None
+        if current_start is not None:
+            loud_ranges.append((current_start, current_end))
+        if not loud_ranges:
+            return [(0, total_samples)]
+
+        merged = []
+        prev_start, prev_end = loud_ranges[0]
+        for start, end in loud_ranges[1:]:
+            if start <= prev_end + hop_samples:
+                prev_end = max(prev_end, end)
+            else:
+                merged.append((prev_start, prev_end))
+                prev_start, prev_end = start, end
+        merged.append((prev_start, prev_end))
+
+        expanded = []
+        pad = overlap_samples
+        for start, end in merged:
+            expanded.append((max(0, start - pad), min(total_samples, end + pad)))
+        return expanded
+
+    base_ranges = detect_loud_ranges() if chorus_only else [(0, total_samples)]
+    segments = build_segments_from_ranges(base_ranges)
+    if not segments:
+        segments = [(0, total_samples)]
+
+    seen = set()
+    dedup_segments = []
+    for seg in segments:
+        if seg not in seen:
+            dedup_segments.append(seg)
+            seen.add(seg)
+    segments = dedup_segments
+
+    if chorus_only:
+        print(f"Basic Pitch: chorus-only mode enabled ({len(segments)} segment(s) selected above {chorus_rms_db} dB).")
+    else:
+        print(f"Basic Pitch: processing audio in {len(segments)} segment(s) of {segment_sec:.1f}s with {overlap_sec:.1f}s overlap.")
+
+    aggregated_notes = []
+    with tempfile.TemporaryDirectory(prefix="basic_pitch_", dir=os.path.dirname(output_midi_path) or None) as tmp_dir:
+        task_specs = []
+        for idx, (start_sample, end_sample) in enumerate(segments):
+            chunk = waveform[:, start_sample:end_sample]
+            if chunk.shape[-1] == 0:
+                continue
+            chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}.wav")
+            torchaudio.save(chunk_path, chunk, sr)
+            offset = start_sample / float(sr)
+            task_specs.append((offset, (
+                chunk_path,
+                model_path,
+                onset_threshold,
+                frame_threshold,
+                min_note_length_ms,
+                min_freq,
+                max_freq,
+                multiple_pitch_bends,
+                melodia_trick,
+                midi_tempo,
+            )))
+
+        if task_specs:
+            max_workers = min(len(task_specs), workers)
+            try:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_offset = {
+                        executor.submit(_basic_pitch_chunk_worker, spec[1]): spec[0]
+                        for spec in task_specs
+                    }
+                    for future in concurrent.futures.as_completed(future_to_offset):
+                        offset = future_to_offset[future]
+                        chunk_notes = future.result()
+                        for start_time, end_time, pitch, velocity in chunk_notes:
+                            global_start = max(0.0, start_time + offset)
+                            global_end = max(global_start + 0.01, min(end_time + offset, total_duration))
+                            aggregated_notes.append((global_start, global_end, pitch, velocity))
+            except Exception as exc:
+                print(f"[WARN] Basic Pitch multiprocessing failed ({exc}); falling back to sequential processing.")
+                aggregated_notes.clear()
+                for offset, args in task_specs:
+                    chunk_notes = _basic_pitch_chunk_worker(args)
+                    for start_time, end_time, pitch, velocity in chunk_notes:
+                        global_start = max(0.0, start_time + offset)
+                        global_end = max(global_start + 0.01, min(end_time + offset, total_duration))
+                        aggregated_notes.append((global_start, global_end, pitch, velocity))
+
+    aggregated_notes.sort(key=lambda item: (item[0], item[2]))
+
+    pm = pretty_midi.PrettyMIDI()
+    instrument = pretty_midi.Instrument(program=0)
+    for start_time, end_time, pitch, velocity in aggregated_notes:
+        velocity = int(max(1, min(127, velocity)))
+        note = pretty_midi.Note(velocity=velocity, pitch=int(pitch), start=float(start_time), end=float(end_time))
+        instrument.notes.append(note)
+
+    if instrument.notes:
+        pm.instruments.append(instrument)
+    pm.write(output_midi_path)
+    return pm.instruments
 
 def split_polyphonic_by_pitch_range(instruments, split_pitch=60):
     """
@@ -124,6 +300,11 @@ def split_polyphonic_by_pitch_range(instruments, split_pitch=60):
 class WavToMidiConverter:
     def __init__(self, config, output_folder="."):
         self.config = config
+        genre = self.config.get("genre")
+        if genre:
+            preset = self.config.get("drum_presets", {}).get(genre)
+            if preset:
+                self.config.setdefault("drum_classification", {}).update(preset)
         self.progress_callbacks = []
         self.measures = []
         self.drums_notes = []
@@ -223,7 +404,9 @@ class WavToMidiConverter:
                 self.update_progress("bpm", current_stage / total_stages * 100)
 
             # 1) chunk-based demucs => reassemble stems
-            stems_dict, sr_stems = self.run_demucs_in_chunks(file_path)
+            save_stems_flag = self.config.get("save_stems", True)
+            stems_tensors, sr_stems = self.run_demucs_in_chunks(file_path, save_stems=save_stems_flag)
+            stems_dict = {name: tensor.cpu().numpy() for name, tensor in stems_tensors.items()}
             current_stage += 1
             self.update_progress("demucs", current_stage / total_stages * 100)
 
@@ -272,14 +455,19 @@ class WavToMidiConverter:
                 os.makedirs(stems_dir, exist_ok=True)
 
                 other_path = os.path.join(stems_dir, f"{base_filename}_other.wav")
+                filtered_other = torchaudio.functional.highpass_biquad(
+                    stems_tensors["other"].to("cpu"),
+                    sr_stems,
+                    cutoff_freq=150.0,
+                ).contiguous()
                 torchaudio.save(
                     other_path,
-                    torch.tensor(stems_dict["other"]),
+                    filtered_other,
                     sr_stems
                 )
                 # Basic Pitch
                 out_midi = get_unique_output_path(other_path, os.path.join(self.output_folder, "stems"), "mid")
-                instruments_poly = transcribe_polyphonic_basic_pitch(other_path, out_midi)
+                instruments_poly = transcribe_polyphonic_basic_pitch(other_path, out_midi, config=self.config)
                 splitted = split_polyphonic_by_pitch_range(instruments_poly, split_pitch=60)
                 self.other_instruments.extend(splitted)
                 current_stage += 1
@@ -406,365 +594,289 @@ class WavToMidiConverter:
                          len(self.bpm_curve) - 1))
         return self.bpm_curve[idx]
 
-    def analyse_measures(self, drums_mono: np.ndarray, sr: int, beats_per_bar: int = 4, ) -> List[Dict]:
-        """
-        Découpe le stem batterie en mesures 4/4, détecte les coups via trois passes:
-            P0 : onsets bruts
-            P1 : passe‑haut >2kHz  → Hi‑Hat/Crash
-            P2 : bande 110‑400Hz    → Toms
-        Renvoie une liste:
-            [{"start":t0, "bpm":…, "notes":[(t_abs, label, velocity)…]}, …]
-        """
-        print("Multi pass measures analyser")
-        measures = []
-        total_dur = len(drums_mono) / sr
-        t0 = 0.0
 
+    def analyse_measures(self,
+                          drums_audio: np.ndarray,
+                          sr: int,
+                          beats_per_bar: int = 4,
+                          spectro_features: Optional[Dict[str, torch.Tensor]] = None) -> List[Dict]:
+        """Analyse each measure, classify hits, and return structured note data."""
+        if spectro_features is None:
+            spectro_features = compute_spectrogram_features(drums_audio, sr, device=DEVICE)
+    
+        print("Multi pass measures analyser")
+        measures: List[Dict] = []
+        total_dur = len(drums_audio) / sr
+        t0 = 0.0
+    
+        double_kicks = np.asarray(detect_double_kick_subband(drums_audio, sr), dtype=np.float32)
+    
+        key_to_time: Dict[float, float] = {}
+        key_to_measures: Dict[float, List[int]] = {}
+        all_keys: List[float] = []
+        per_measure_onsets: List[List[float]] = []
+    
         while t0 < total_dur:
-            # ---- BPM & longueur mesure ----
             bpm = self.get_bpm_at(t0)
             bar_len = 60.0 / bpm * beats_per_bar
             t1 = min(t0 + bar_len, total_dur)
-
-            # ---- Segment audio ----
+    
             s0, s1 = int(t0 * sr), int(t1 * sr)
-            y_bar = drums_mono[s0:s1]
-
-            # RMS moyen de la mesure (dBFS)
+            y_bar = drums_audio[s0:s1]
+    
             rms_db = 20 * np.log10(np.sqrt(np.mean(y_bar ** 2)) + 1e-12)
-
-            # Nombre d’échantillons > -35dBFS (pics)
             peaks = np.sum(np.abs(y_bar) > (10 ** (-35 / 20)))
-
-            if rms_db < -50 and peaks < 100:  # seuils à ajuster
-                measures.append({"start": t0, "bpm": bpm, "notes": []})
+    
+            measures.append({"start": t0, "bpm": bpm, "notes": []})
+    
+            if rms_db < -50 and peaks < 100:
+                per_measure_onsets.append([])
                 t0 = t1
                 continue
-
-            # =========================================================
-            #  P0 : onsets “généraux” (Kick / Snare / tout)
-            # =========================================================
+    
             on0 = librosa.onset.onset_detect(
                 y=y_bar, sr=sr, hop_length=128, backtrack=True,
                 delta=0.05, pre_max=10, post_max=10)
-
-            # =========================================================
-            #  P1 : Hi‑Hat & Crash  (passe‑haut 2kHz)
-            # =========================================================
             y_hi = butter_band(y_bar, sr, 2000, None, order=4, btype='high')
             on1 = librosa.onset.onset_detect(
                 y=y_hi, sr=sr, hop_length=128, backtrack=True,
                 delta=0.03, pre_max=8, post_max=8)
-
-            # =========================================================
-            #  P2 : Toms  (bande 110‑400Hz)
-            # =========================================================
             y_tom = butter_band(y_bar, sr, 110, 400, order=4, btype='band')
             on2 = librosa.onset.onset_detect(
                 y=y_tom, sr=sr, hop_length=256, backtrack=True,
                 delta=0.04, pre_max=6, post_max=6)
-
-            # ---- Fusion / dé‑doublonnage (tolérance 20ms) ----
+    
             frames = np.concatenate([on0, on1, on2])
             times = librosa.frames_to_time(frames, sr=sr, hop_length=128) + t0
-            # arrondi au 0.02s pour cluster
-            times_unique = np.unique(np.round(times / 0.02) * 0.02)
-
-            # ---- Classification coup par coup ----
-            notes = []
-            for idx, t_abs in enumerate(times_unique):
-                nxt = times_unique[idx + 1] if idx + 1 < len(times_unique) else None
-                label, vel = self.classify_drum_hit_metal(
-                    drums_mono, sr, float(t_abs), next_onset_time=nxt)
-                if label != "unknown":
-                    notes.append((float(t_abs), label, vel))
-
-            measures.append({"start": t0, "bpm": bpm, "notes": notes})
+    
+            if double_kicks.size:
+                dk_mask = (double_kicks >= t0) & (double_kicks < t1)
+                if np.any(dk_mask):
+                    times = np.concatenate([times, double_kicks[dk_mask]])
+    
+            if times.size:
+                times = np.unique(np.round(times / 0.02) * 0.02)
+            else:
+                times = np.array([], dtype=np.float32)
+    
+            per_measure_onsets.append(times.tolist())
+    
+            for t_abs in times:
+                key = round(float(t_abs), 5)
+                if key not in key_to_time:
+                    key_to_time[key] = float(t_abs)
+                    all_keys.append(key)
+                key_to_measures.setdefault(key, []).append(len(measures) - 1)
+    
             t0 = t1
+    
+        if not all_keys:
+            return measures
+    
+        sorted_keys = sorted(all_keys, key=lambda k: key_to_time[k])
+        sorted_times = [key_to_time[k] for k in sorted_keys]
+        labels, velocities = classify_drum_hits_metal(drums_audio, sr, sorted_times, spectro_features, self.config)
+        classification = {key: (label, vel) for key, label, vel in zip(sorted_keys, labels, velocities)}
+    
+        for measure_idx, onset_list in enumerate(per_measure_onsets):
+            measure_notes: List[Tuple[float, str, int]] = []
+            for t_abs in onset_list:
+                key = round(float(t_abs), 5)
+                label, vel = classification.get(key, ("unknown", 40))
+                if label != "unknown":
+                    measure_notes.append((float(t_abs), label, int(vel)))
+            measures[measure_idx]["notes"] = measure_notes
+    
         return measures
-
-    def run_demucs_in_chunks(self, file_path):
-        """
-        Splits input into demucs_chunk_sec slices,
-        runs demucs on each chunk, reassembles stems.
-        """
+    
+    
+    
+    def run_demucs_in_chunks(self, file_path, save_stems: Optional[bool] = None):
+        """Run Demucs on an audio file in smaller chunks."""
+        if save_stems is None:
+            save_stems = self.config.get("save_stems", True)
+    
         print("Demucs in chunks to split the audio in Drums, Bass, Vocals, Other")
-        stems_dir = os.path.join(self.output_folder, "stems")
-        os.makedirs(stems_dir, exist_ok=True)
-
+    
         base_filename = os.path.splitext(os.path.basename(file_path))[0]
-
-        wav, sr = torchaudio.load(file_path)
-        # stereo if needed
-        if wav.shape[0] == 1:
-            wav = torch.cat([wav, wav], dim=0)
+    
+        waveform, sr = torchaudio.load(file_path)
+        waveform = waveform.to(torch.float32)
+        if waveform.shape[0] == 1:
+            waveform = waveform.repeat(2, 1)
+    
         model = get_model(self.config["demucs_model"]).to(device)
         model.eval()
-
-        # If sr != model.samplerate => resample
+    
         if sr != model.samplerate:
             resampler = torchaudio.transforms.Resample(sr, model.samplerate)
-            wav = resampler(wav)
+            waveform = resampler(waveform)
             sr = model.samplerate
-
-        chunk_size_samples = int(sr * self.config["demucs_chunk_sec"])
-
-        # We'll accumulate partial stems in a list of arrays
-        stems_accum = {
+    
+        chunk_size_samples = max(1, int(sr * self.config["demucs_chunk_sec"]))
+    
+        stems_accum: Dict[str, List[torch.Tensor]] = {
             "drums": [],
             "bass": [],
             "other": [],
-            "vocals": []
+            "vocals": [],
         }
         stem_order = ["drums", "bass", "other", "vocals"]
-
-        total_len = wav.shape[-1]
-        start = 0
-        while start < total_len:
-            end = min(start + chunk_size_samples, total_len)
-            chunk_data = wav[..., start:end].unsqueeze(0).to(device)  # shape (1,2,chunk)
-            with torch.no_grad():
-                out = apply_model(model, chunk_data, overlap=self.config["demucs_overlap"])
-                # out => shape (1,4,2,chunk_len)
-                out = out.squeeze(0).cpu().numpy()  # => (4,2,chunk_len)
-            for i, name in enumerate(stem_order):
-                stems_accum[name].append(out[i])
-            start += chunk_size_samples
-
-            # Update progress for demucs
-            progress_value = (start / total_len) * 100
+    
+        total_len = waveform.shape[-1]
+        cursor = 0
+        while cursor < total_len:
+            end = min(cursor + chunk_size_samples, total_len)
+            chunk = waveform[..., cursor:end]
+            if chunk.numel() == 0:
+                break
+    
+            chunk = chunk.unsqueeze(0).to(device, non_blocking=True)
+    
+            with torch.inference_mode():
+                if device.type == "cuda":
+                    autocast_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+                else:
+                    autocast_ctx = contextlib.nullcontext()
+                with autocast_ctx:
+                    out = apply_model(
+                        model,
+                        chunk,
+                        overlap=self.config["demucs_overlap"],
+                    )
+            out = out.squeeze(0).to("cpu", dtype=torch.float32)
+    
+            for idx, name in enumerate(stem_order):
+                stems_accum[name].append(out[idx])
+    
+            cursor = end
+            progress_value = (cursor / total_len) * 100 if total_len else 100.0
             self.update_progress("demucs", progress_value)
-
-        # reassemble
-        final_stems = {}
+    
+        final_stems: Dict[str, torch.Tensor] = {}
         for name in stem_order:
-            arrs = stems_accum[name]
-            if len(arrs) > 0:
-                cat_data = np.concatenate(arrs, axis=-1)  # shape => (2, total_samples)
-                final_stems[name] = cat_data
+            segments = stems_accum[name]
+            if segments:
+                final_tensor = torch.cat(segments, dim=-1)
             else:
-                # Handle empty case by returning an empty array with the correct shape
-                final_stems[name] = np.zeros((2, 0), dtype=np.float32)
-
-        # Save each stem with a unique filename
-        for name in stem_order:
-            stem_path = os.path.join(stems_dir, f"{base_filename}_{name}.wav")
-            torchaudio.save(
-                stem_path,
-                torch.tensor(final_stems[name]),
-                sr
-            )
-
+                final_tensor = torch.zeros((2, 0), dtype=torch.float32)
+            final_stems[name] = final_tensor
+    
+        if save_stems:
+            stems_dir = os.path.join(self.output_folder, "stems")
+            os.makedirs(stems_dir, exist_ok=True)
+            for name, tensor in final_stems.items():
+                stem_path = os.path.join(stems_dir, f"{base_filename}_{name}.wav")
+                torchaudio.save(stem_path, tensor, sr)
+    
         return final_stems, sr
-
-    def extract_drum_features(self, audio, sr):
-        if audio.ndim > 1:
-            audio = audio.mean(axis=0)
-
-        # --- Spectrogram ---
-        n_fft = 1024
-        hop_length = 256
-        D = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
-        S_mag = np.abs(D)  # <-- ensures real-valued magnitude
-
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-        S_log = np.log10(S_mag ** 2 + 1e-9)
-        S_mean = np.mean(S_log, axis=1)
-
-        # --- Band energies ---
-        def band_energy(fmin, fmax):
-            idx = (freqs >= fmin) & (freqs < fmax)
-            return float(np.mean(S_mean[idx])) if np.any(idx) else 0.0
-
-        e_sub = band_energy(20, 80)
-        e_punch = band_energy(80, 200)
-        e_mid = band_energy(200, 800)
-        e_high = band_energy(2000, 8000)
-
-        # --- Spectral features ---
-        centroid = librosa.feature.spectral_centroid(S=S_mag, sr=sr)[0]
-        bandwidth = librosa.feature.spectral_bandwidth(S=S_mag, sr=sr)[0]
-        rolloff = librosa.feature.spectral_rolloff(S=S_mag, sr=sr, roll_percent=0.90)[0]
-
-        centroid_mean = float(np.mean(centroid))
-        bandwidth_mean = float(np.mean(bandwidth))
-        rolloff_mean = float(np.mean(rolloff))
-
-        # --- Peak frequency bin ---
-        peak_freq = freqs[np.argmax(S_mean)] if len(S_mean) > 0 else 0.0
-
-        # --- Envelope & transient features ---
-        envelope = librosa.onset.onset_strength(y=audio, sr=sr)
-        if len(envelope) >= 5:
-            attack_strength = np.max(envelope[:5]) - np.mean(envelope[5:10]) if len(envelope) >= 10 else np.max(
-                envelope[:5]) - np.mean(envelope[5:])
-            envelope_std = float(np.std(envelope))
-            decay_rate = float((envelope[2] - envelope[-1]) / (len(envelope) - 2)) if len(envelope) > 2 else 0.0
-        else:
-            attack_strength = 0.0
-            envelope_std = 0.0
-            decay_rate = 0.0
-
-        # --- Amplitude ---
-        rms = np.sqrt(np.mean(audio ** 2)) if len(audio) > 0 else 0.0
-        peak = np.max(np.abs(audio)) if len(audio) > 0 else 0.0
-        amplitude = 0.7 * peak + 0.3 * rms
-
-        # --- Spectral Flux ---
-        spectral_flux = float(np.mean(librosa.onset.onset_strength(S=S_mag, sr=sr))) if len(audio) > 0 else 0.0
-
-        # --- Zero Crossing Rate ---
-        zcr = float(np.mean(librosa.feature.zero_crossing_rate(audio))) if len(audio) > 0 else 0.0
-
-        # --- Return real-valued, safe dictionary ---
-        return {
-            "e_sub": e_sub,
-            "e_punch": e_punch,
-            "e_mid": e_mid,
-            "e_high": e_high,
-            "centroid_mean": centroid_mean,
-            "bandwidth_mean": bandwidth_mean,
-            "rolloff_mean": rolloff_mean,
-            "peak_freq_bin": peak_freq,
-            "attack_strength": attack_strength,
-            "envelope_std": envelope_std,
-            "decay_rate": decay_rate,
-            "spectral_flux": spectral_flux,
-            "zero_crossing_rate": zcr,
-            "amplitude": amplitude
-        }
-
-    def compute_drum_velocity(self, audio_segment, sr=16000):
-
-        # Safety check: If the segment is empty, return a default
-        if len(audio_segment) == 0:
-            return 64
-
-        # Calculate RMS and Peak
-        rms_val = float(np.sqrt(np.mean(audio_segment ** 2)))  # Root Mean Square
-        peak_val = float(np.max(np.abs(audio_segment)))  # Absolute peak amplitude
-
-        # Combine them into a single “raw” measure
-        # You can tune these multipliers based on your own mixes:
-        # e.g. weighting peaks more strongly than RMS, or vice-versa.
-        raw_amplitude = 0.7 * peak_val + 0.3 * rms_val
-
-        # Scale up to a typical drum “velocity” range
-        # You can tweak the scale and minimum to taste:
-        scale_factor = 320.0  # overall multiplier
-        minimum_val = 30  # minimum velocity so small hits don’t vanish
-        velocity = int(round(raw_amplitude * scale_factor))
-
-        # Clamp into 1..127
-        velocity = max(1, min(velocity, 127))
-        if velocity < minimum_val:
-            velocity = minimum_val
-
-        return velocity
-
-    def classify_drum_hit_metal(self, audio_mono: np.ndarray, sr: int, onset_time: float, next_onset_time: Optional[float] = None, debug: bool = False):
-        """
-        •Fenêtre adaptative (60ms par défaut/12ms si kick dominateur)
-        •Multi‑bande: Sub, Mid, Hi+ bande Snare large
-        •Scoring Kick/Snare→arbitrage prioritaire
-        •Fallback : Hi‑Hat/ Crash/ Tom/ Floor
-        """
-        # ---------------------- 1) Fenêtre adaptative -------------------
-        bpm = self.get_bpm_at(onset_time) if hasattr(self, "get_bpm_at") else 120.0
-        base_len = 0.06  # 60ms
-        max_len = 0.12  # 120ms si kick fort
-        seg_len = base_len
-
-        # petit “sondage” Sub pour décider
-        pre = audio_mono[int(onset_time * sr): int((onset_time + base_len) * sr)]
-        p_perc, _ = librosa.effects.hpss(pre)
-        r_sub_check = band_energy(p_perc, sr, 20, 120) / (
-                band_energy(p_perc, sr, 20, 12000) + 1e-8
-        )
-        if r_sub_check > 0.25:
-            seg_len = max_len
-
-        if next_onset_time:
-            seg_len = min(seg_len, next_onset_time - onset_time - 0.003)
-        seg_len = max(0.04, seg_len)
-
-        s0, s1 = int(onset_time * sr), int((onset_time + seg_len) * sr)
-        seg = audio_mono[s0:s1]
-        if len(seg) < 32:
-            return "unknown", 40
-
-        # ---------------------- 2) HPSS + nettoyage ---------------------
-        percussive, _ = librosa.effects.hpss(seg)
-        percussive = np.nan_to_num(percussive)
-
-        # ---------------------- 3) Énergies de bandes -------------------
-        E_tot = band_energy(percussive, sr, 20, 12000) + 1e-8
-        E_sub = band_energy(percussive, sr, 20, 120)
-        E_mid = band_energy(percussive, sr, 200, 2000)
-        E_hi = band_energy(percussive, sr, 4500, 12000)
-        E_sn_broad = band_energy(percussive, sr, 400, 5000)
-
-        r_sub, r_mid, r_hi = E_sub / E_tot, E_mid / E_tot, E_hi / E_tot
-        r_sn_broad = E_sn_broad / E_tot
-
-        centroid = librosa.feature.spectral_centroid(y=percussive, sr=sr)[0].mean()
-        S = np.abs(librosa.stft(percussive, n_fft=512, hop_length=128)) ** 2
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=512)
-        peak_freq = freqs[np.argmax(S.mean(axis=1))]
-        bandwidth = librosa.feature.spectral_bandwidth(y=percussive, sr=sr)[0].mean()
-
-        attack = np.max(percussive) - np.mean(np.abs(percussive))
-        decay = (percussive[0] - percussive[-1]) / len(percussive)
-
-        vel = self.compute_drum_velocity(seg, sr)
-
-        # ---------------------- 4) Scoring Kick / Snare -----------------
-        kick_score = (3 * (r_sub > 0.30) +
-                      2 * (centroid < 900) +
-                      2 * (peak_freq < 120) +
-                      1 * (attack > 0.05))
-
-        sn_score = (3 * (r_mid > 0.18) +
-                    2 * (900 <= centroid <= 3300) +
-                    2 * (180 <= peak_freq <= 350) +
-                    1 * (attack > 0.04) +
-                    1 * (decay > -0.55) +
-                    1 * (r_sn_broad > 0.45))
-
-        primary = "kick" if kick_score >= sn_score + 2 else "snare"
-
-        if primary in ("kick", "snare"):
-            if debug:
-                print(f"{onset_time:7.3f}s  {primary.upper():5}  "
-                      f"K:{kick_score} S:{sn_score} "
-                      f"sub:{r_sub:.2f} mid:{r_mid:.2f} hi:{r_hi:.2f}")
-            return primary, vel
-
-        # ---------------------- 5) Hi‑Hat / Crash -----------------------
-        if r_hi > 0.30 and centroid > 3500:
-            # Hi‑Hat (closed / open)
-            if decay > -0.30 and attack < 0.10:
-                return "hihat_open", vel
-            return "hihat", vel
-
-        if (centroid > 5000 or bandwidth > 4000) and r_hi > 0.25:
-            return ("crash2" if centroid > 6500 else "crash1"), vel
-
-        # ---------------------- 6) Toms / Floor ------------------------
-        if 110 <= peak_freq < 180 and r_sub > 0.20:
-            return "floor", vel
-        if 180 <= peak_freq < 260:
-            return "tom2", vel
-        if 260 <= peak_freq < 400:
-            return "tom1", vel
-
-        # ---------------------- 7) Inconnu -----------------------------
-        if debug:
-            print(f"{onset_time:7.3f}s  UNKNOWN  "
-                  f"sub:{r_sub:.2f} mid:{r_mid:.2f} hi:{r_hi:.2f} "
-                  f"cent:{centroid:.0f} pf:{peak_freq:.0f}")
-        return "unknown", vel
-
+    
+    
+        def extract_drum_features(self, audio, sr):
+            if audio.ndim > 1:
+                audio = audio.mean(axis=0)
+    
+            # --- Spectrogram ---
+            n_fft = 1024
+            hop_length = 256
+            D = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
+            S_mag = np.abs(D)  # <-- ensures real-valued magnitude
+    
+            freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+            S_log = np.log10(S_mag ** 2 + 1e-9)
+            S_mean = np.mean(S_log, axis=1)
+    
+            # --- Band energies ---
+            def band_energy(fmin, fmax):
+                idx = (freqs >= fmin) & (freqs < fmax)
+                return float(np.mean(S_mean[idx])) if np.any(idx) else 0.0
+    
+            e_sub = band_energy(20, 80)
+            e_punch = band_energy(80, 200)
+            e_mid = band_energy(200, 800)
+            e_high = band_energy(2000, 8000)
+    
+            # --- Spectral features ---
+            centroid = librosa.feature.spectral_centroid(S=S_mag, sr=sr)[0]
+            bandwidth = librosa.feature.spectral_bandwidth(S=S_mag, sr=sr)[0]
+            rolloff = librosa.feature.spectral_rolloff(S=S_mag, sr=sr, roll_percent=0.90)[0]
+    
+            centroid_mean = float(np.mean(centroid))
+            bandwidth_mean = float(np.mean(bandwidth))
+            rolloff_mean = float(np.mean(rolloff))
+    
+            # --- Peak frequency bin ---
+            peak_freq = freqs[np.argmax(S_mean)] if len(S_mean) > 0 else 0.0
+    
+            # --- Envelope & transient features ---
+            envelope = librosa.onset.onset_strength(y=audio, sr=sr)
+            if len(envelope) >= 5:
+                attack_strength = np.max(envelope[:5]) - np.mean(envelope[5:10]) if len(envelope) >= 10 else np.max(
+                    envelope[:5]) - np.mean(envelope[5:])
+                envelope_std = float(np.std(envelope))
+                decay_rate = float((envelope[2] - envelope[-1]) / (len(envelope) - 2)) if len(envelope) > 2 else 0.0
+            else:
+                attack_strength = 0.0
+                envelope_std = 0.0
+                decay_rate = 0.0
+    
+            # --- Amplitude ---
+            rms = np.sqrt(np.mean(audio ** 2)) if len(audio) > 0 else 0.0
+            peak = np.max(np.abs(audio)) if len(audio) > 0 else 0.0
+            amplitude = 0.7 * peak + 0.3 * rms
+    
+            # --- Spectral Flux ---
+            spectral_flux = float(np.mean(librosa.onset.onset_strength(S=S_mag, sr=sr))) if len(audio) > 0 else 0.0
+    
+            # --- Zero Crossing Rate ---
+            zcr = float(np.mean(librosa.feature.zero_crossing_rate(audio))) if len(audio) > 0 else 0.0
+    
+            # --- Return real-valued, safe dictionary ---
+            return {
+                "e_sub": e_sub,
+                "e_punch": e_punch,
+                "e_mid": e_mid,
+                "e_high": e_high,
+                "centroid_mean": centroid_mean,
+                "bandwidth_mean": bandwidth_mean,
+                "rolloff_mean": rolloff_mean,
+                "peak_freq_bin": peak_freq,
+                "attack_strength": attack_strength,
+                "envelope_std": envelope_std,
+                "decay_rate": decay_rate,
+                "spectral_flux": spectral_flux,
+                "zero_crossing_rate": zcr,
+                "amplitude": amplitude
+            }
+    
+        def compute_drum_velocity(self, audio_segment, sr=16000):
+    
+            # Safety check: If the segment is empty, return a default
+            if len(audio_segment) == 0:
+                return 64
+    
+            # Calculate RMS and Peak
+            rms_val = float(np.sqrt(np.mean(audio_segment ** 2)))  # Root Mean Square
+            peak_val = float(np.max(np.abs(audio_segment)))  # Absolute peak amplitude
+    
+            # Combine them into a single “raw” measure
+            # You can tune these multipliers based on your own mixes:
+            # e.g. weighting peaks more strongly than RMS, or vice-versa.
+            raw_amplitude = 0.7 * peak_val + 0.3 * rms_val
+    
+            # Scale up to a typical drum “velocity” range
+            # You can tweak the scale and minimum to taste:
+            scale_factor = 320.0  # overall multiplier
+            minimum_val = 30  # minimum velocity so small hits don’t vanish
+            velocity = int(round(raw_amplitude * scale_factor))
+    
+            # Clamp into 1..127
+            velocity = max(1, min(velocity, 127))
+            if velocity < minimum_val:
+                velocity = minimum_val
+    
+            return velocity
+    
     def process_drums_in_chunks(self, drums_stem: np.ndarray, sr: int) -> None:
         """
         1.  Mono + courbe BPM locale
@@ -790,109 +902,34 @@ class WavToMidiConverter:
             apply_rms_gate=self.config.get("pre_rms_gate", True),
             apply_eq_bands=self.config.get("pre_eq_bands", False),
         )
+        spectro_features = compute_spectrogram_features(audio_proc, sr_proc, device=DEVICE)
 
         # ---------- 2) BPM /‑chunks ----------
         self.detect_bpm_curve(mono, sr)  # crée self.bpm_curve / self.bpm_times
 
         # ---------- 3) Analyse mesure par mesure ----------
-        measures = self.analyse_measures(mono, sr)  # détecte & classe
+        measures = self.analyse_measures(audio_proc, sr_proc, spectro_features=spectro_features)
         measures = [quantize_measure(m) for m in measures]  # quantize
 
         # ---------- 4) Stockage ----------
         self.measures = measures  # utilisé plus tard pour l’écriture MIDI
+
+        # Génère une liste plate pour les diagnostics éventuels
+        self.drums_notes = []
+        drum_map = self.config.get("drum_map", {})
+        default_pitch = drum_map.get("unknown", 39)
+        for measure in self.measures:
+            for start_time, label, velocity in measure["notes"]:
+                pitch = drum_map.get(label, default_pitch)
+                self.drums_notes.append(
+                    safe_note(velocity=velocity, pitch=pitch, start=start_time, end=start_time + 0.05)
+                )
 
         # 6) Diagnostic graphique (facultatif)
         if self.config.get("debug_plot", False):
             plot_drum_detections(audio_proc, sr_proc,
                                  self.drums_notes,
                                  title=f"Debug – {self.base_filename}")
-
-
-    def process_drums_in_chunks_00(self, drums_stem, sr):
-        """
-        •Applique le pré‑processing choisi par l’utilisateur
-        •Pré‑calcule la courbe BPM
-        •Détecte + classe les onsets (Kick, Snare, HH, Toms…)
-        •Alimente self.drums_notes
-        """
-        # 1) Stéréo → Mono
-        if drums_stem.shape[0] > 1:
-            audio_mono = drums_stem.mean(axis=0)
-        else:
-            audio_mono = drums_stem[0]
-        audio_mono = np.asarray(audio_mono).flatten().astype(np.float32)
-
-        # 2) PRE‑PROCESSING (options lues depuis self.config)
-        audio_proc, sr_proc = preprocess_drum_stem(
-            audio_mono,
-            sr,
-            target_sr=48_000,  # ou sr pour garder la fréquence d’origine
-            apply_expander=self.config.get("pre_expander", True),
-            apply_hpss=self.config.get("pre_hpss", True),
-            apply_spectral_gate=self.config.get("pre_spec_gate", True),
-            apply_rms_gate=self.config.get("pre_rms_gate", True),
-            apply_eq_bands=self.config.get("pre_eq_bands", False),
-        )
-        # Analyse des mesures
-        measures = self.analyse_measures(audio_proc, sr_proc)
-        self.measures = measures
-
-        # 3) Pré‑calcul BPM local
-        self.precompute_bpm_curve(audio_proc, sr_proc)
-
-        # 4) Découpage en chunks +détection onsets
-        chunk_len = int(sr_proc * self.config["crepe_chunk_sec"])
-        all_onsets = []
-        n_samples = len(audio_proc)
-
-        for start in range(0, n_samples, chunk_len):
-            end = min(start + chunk_len, n_samples)
-            chunk = audio_proc[start:end]
-            offset = start / sr_proc
-
-            onset_env = librosa.onset.onset_strength(y=chunk, sr=sr_proc, hop_length=64)
-            onsets = librosa.onset.onset_detect(
-                onset_envelope=onset_env,
-                sr=sr_proc,
-                hop_length=64,
-                units='time',
-                backtrack=True,
-                delta=0.005, wait=3, pre_max=5, post_max=5
-            )
-            all_onsets.extend([o + offset for o in onsets])
-
-            # progress bar «drums»
-            prog = min(100.0, (end / n_samples) * 100)
-            self.update_progress("drums", prog)
-
-        # 5) Clustering (≤10ms) puis classification
-        all_onsets.sort()
-        clusters, CLUSTER = [], 0.01
-        if all_onsets:
-            cur = [all_onsets[0]]
-            for t in all_onsets[1:]:
-                if t - cur[-1] <= CLUSTER:
-                    cur.append(t)
-                else:
-                    clusters.append(cur);
-                    cur = [t]
-            clusters.append(cur)
-
-        for cl in clusters:
-            for i, t in enumerate(cl):
-                nxt = cl[i + 1] if i + 1 < len(cl) else None
-                label, vel = self.classify_drum_hit_metal(
-                    audio_proc, sr_proc, t, next_onset_time=nxt)
-                if label in self.config["drum_map"]:
-                    note = safe_note(
-                        velocity=vel,
-                        pitch=self.config["drum_map"][label],
-                        start=t,
-                        end=t + 0.10  # 100ms note‑off
-                    )
-                    self.drums_notes.append(note)
-
-
 
 
 ###############################################################################

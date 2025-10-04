@@ -10,3 +10,4 @@ pretty_midi==0.2.10
 basic-pitch==0.4.0
 pygame
 matplotlib
+scipy==1.11.4

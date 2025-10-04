@@ -14,13 +14,14 @@ Auteur: refactor torchcrepe (remplace crepe) – Python 3.11 / CUDA 11.8
 from __future__ import annotations
 import math
 from typing import Iterable, Dict, List, Sequence, Tuple
-
 import numpy as np
+from scipy import signal as sig
 import librosa
 import torch
+import torchaudio
 import pretty_midi
 import torchcrepe
-
+import os
 
 # ======================================================================
 # Configuration runtime
@@ -73,22 +74,36 @@ def safe_note(velocity: int, pitch: int, start: float, end: float) -> pretty_mid
 # Audio → vélocité (RMS → 30..127)
 # ======================================================================
 
-def velocity_from_amplitude(segment: np.ndarray, floor_db: float = -40.0) -> int:
-    """
-    Convertit l'amplitude d'un segment en vélocité MIDI.
-    - Calcule le RMS → dBFS, puis mappe dans [30..127].
-    """
-    if segment is None or len(segment) == 0:
+
+def velocity_from_amplitude(segment, floor_db: float = -40.0) -> int:
+    """Convert segment amplitude to a MIDI velocity."""
+    if segment is None:
         return 64
-    seg = segment.astype(np.float32, copy=False)
-    rms = float(np.sqrt(np.mean(seg * seg) + _EPS))
-    # dBFS (si max=1)
-    db = 20.0 * math.log10(max(rms, _EPS))
-    # Normalise par un plancher (ex: -40 dBFS) → [0..1]
-    norm = (db - floor_db) / (0.0 - floor_db)
-    norm = clamp(norm, 0.0, 1.0)
-    vel = int(round(30 + norm * (127 - 30)))
-    return int(clamp(vel, 30, 127))
+    if torch.is_tensor(segment):
+        if segment.numel() == 0:
+            return 64
+        seg = segment.detach().to(dtype=torch.float32)
+        rms = torch.sqrt(torch.mean(seg * seg) + _EPS)
+        rms = torch.clamp(rms, min=1e-12)
+        db = 20.0 * torch.log10(rms)
+        norm = torch.clamp((db - floor_db) / (-floor_db), 0.0, 1.0)
+        velocity = torch.round(30 + norm * (127 - 30))
+        velocity = torch.clamp(velocity, 30, 127)
+        if torch.isnan(velocity):
+            return 64
+        return int(velocity.item())
+    if isinstance(segment, np.ndarray):
+        if len(segment) == 0:
+            return 64
+        seg = segment.astype(np.float32, copy=False)
+        rms = float(np.sqrt(np.mean(seg * seg) + _EPS))
+        db = 20.0 * math.log10(max(rms, _EPS))
+        norm = (db - floor_db) / (0.0 - floor_db)
+        norm = clamp(norm, 0.0, 1.0)
+        vel = int(round(30 + norm * (127 - 30)))
+        return int(clamp(vel, 30, 127))
+    segment_np = np.asarray(segment, dtype=np.float32)
+    return velocity_from_amplitude(segment_np, floor_db=floor_db)
 
 def band_energy(y, sr, fmin, fmax):
     """Énergie spectrale intégrée entre fmin & fmax (Hz)."""
@@ -102,9 +117,22 @@ def band_energy(y, sr, fmin, fmax):
 # Fréquences / lissage / groupage
 # ======================================================================
 
-def smooth_frequencies(freq_array: np.ndarray, window_size: int = 5) -> np.ndarray:
-    """Moyenne glissante simple (padding 'edge')."""
-    if window_size < 2 or len(freq_array) == 0:
+
+def smooth_frequencies(freq_array, window_size: int = 5):
+    """Simple moving average smoothing that works with NumPy or torch tensors."""
+    if window_size < 2:
+        return freq_array
+    if torch.is_tensor(freq_array):
+        if freq_array.numel() == 0:
+            return freq_array
+        pad = window_size // 2
+        kernel = torch.ones(1, 1, window_size, dtype=freq_array.dtype, device=freq_array.device) / float(window_size)
+        padded = torch.nn.functional.pad(freq_array.view(1, 1, -1), (pad, pad), mode='replicate')
+        smoothed = torch.nn.functional.conv1d(padded, kernel)
+        L = freq_array.numel()
+        return smoothed.view(-1)[:L]
+    freq_array = np.asarray(freq_array, dtype=np.float32)
+    if freq_array.size == 0:
         return freq_array
     pad = window_size // 2
     padded = np.pad(freq_array, (pad, pad), mode="edge")
@@ -336,109 +364,418 @@ def _estimate_beats(audio_mono: np.ndarray, sr: int, bpm_hint: float) -> np.ndar
 # Pitch tracking monophonique par chunks (torchcrepe)
 # ======================================================================
 
+
+def _normalize_torchcrepe_capacity(cap: str) -> str:
+    """
+    torchcrepe ne supporte que 'full' et 'tiny'.
+    On mappe les valeurs héritées de CREPE ('small','medium','large','full','tiny')
+    vers une valeur valide.
+    """
+    if not cap:
+        return "full"
+    cap = cap.lower().strip()
+    if cap in ("full",):
+        return "full"
+    if cap in ("tiny",):
+        return "tiny"
+    # Mappings hérités de CREPE → torchcrepe
+    if cap in ("large", "xlarge", "xl"):
+        return "full"
+    if cap in ("small", "sm", "medium", "md"):
+        return "tiny"
+    # fallback par défaut
+    return "full"
+
+
 def chunk_torchcrepe(audio: np.ndarray,
                      sr: int,
                      chunk_sec: float = 30.0,
-                     model_capacity: str = "full",      # "tiny","small","medium","large","full"
-                     confidence_threshold: float = 0.85, # périodicité min (voicing)
+                     model_capacity: str = "full",
+                     confidence_threshold: float = 0.85,
                      smooth_window: int = 5,
                      pitch_tol: float = 1.0,
                      max_gap: float = 0.15,
                      min_note_length: float = 0.05,
                      fmin: float = 50.0,
                      fmax: float = 1100.0,
-                     hop_length: int = 160,             # 10 ms @ 16 kHz
+                     hop_length: int = 160,
                      batch_size: int = 2048) -> List[pretty_midi.Note]:
-    """
-    Extraction des notes monophoniques par chunks via torchcrepe.
-    Retourne une liste de pretty_midi.Note (non fusionnées, non quantifiées).
-    """
-    # 1) Mono + normalisation
+    """Torchcrepe chunked inference with minimal CPU/GPU transfers."""
     if audio.ndim > 1:
         audio = audio.mean(axis=0)
-    audio = audio.astype(np.float32, copy=False)
-    if len(audio) == 0:
+    device = torch.device(DEVICE)
+    audio_tensor = torch.as_tensor(audio, dtype=torch.float32, device=device)
+    if audio_tensor.numel() == 0:
         return []
 
-    peak = float(np.max(np.abs(audio)))
-    if peak > 0.0:
-        audio = audio / peak
+    peak = audio_tensor.abs().max()
+    if peak > 0:
+        audio_tensor = audio_tensor / peak
 
-    # 2) Resample 16 kHz (torchcrepe)
+    capacity = _normalize_torchcrepe_capacity(model_capacity)
+
     if sr != 16000:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        resampler = torchaudio.transforms.Resample(sr, 16000)
+        if device.type == "cuda":
+            resampler = resampler.to(device)
+        audio_tensor = resampler(audio_tensor.unsqueeze(0)).squeeze(0)
         sr = 16000
 
-    # 3) Chunks
+    audio_tensor = audio_tensor.contiguous()
     chunk_size_samples = int(max(0.5, chunk_sec) * sr)
-    total_len = len(audio)
-    start_sample = 0
-
+    total_len = audio_tensor.shape[0]
     notes_all: List[pretty_midi.Note] = []
+    start_sample = 0
 
     while start_sample < total_len:
         end_sample = min(start_sample + chunk_size_samples, total_len)
-        chunk = audio[start_sample:end_sample]
-
-        # Tensor (batch, time) sur DEVICE
-        x = torch.tensor(chunk, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-
-        # torchcrepe.predict → f0 (Hz), periodicity
-        with torch.no_grad():
-            f0, periodicity = torchcrepe.predict(
-                x,
-                sr=sr,
-                hop_length=hop_length,
-                fmin=fmin,
-                fmax=fmax,
-                model=model_capacity,
-                batch_size=batch_size,
-                device=DEVICE,
-                return_periodicity=True
-            )
-
-        # Convert en numpy 1D
-        f0 = f0.squeeze(0).detach().cpu().numpy()
-        per = periodicity.squeeze(0).detach().cpu().numpy()
-
-        # Masque "voicing": périodicité >= seuil
-        mask = per >= confidence_threshold
-        if not np.any(mask):
-            start_sample += chunk_size_samples
+        chunk = audio_tensor[start_sample:end_sample]
+        if chunk.numel() == 0:
+            start_sample = end_sample
             continue
 
-        # Timeline (en s) + offset global du chunk
-        t = (np.arange(len(f0), dtype=np.float64) * hop_length) / float(sr)
-        t += (start_sample / float(sr))
+        x = chunk.unsqueeze(0)
+        with torch.no_grad():
+            try:
+                f0, periodicity = torchcrepe.predict(
+                    x,
+                    sr,
+                    hop_length,
+                    fmin,
+                    fmax,
+                    model=capacity,
+                    batch_size=batch_size,
+                    device=DEVICE,
+                    return_periodicity=True,
+                )
+            except TypeError:
+                f0 = torchcrepe.predict(
+                    x,
+                    sr,
+                    hop_length,
+                    fmin,
+                    fmax,
+                    model=capacity,
+                    batch_size=batch_size,
+                    device=DEVICE,
+                )
+                periodicity = torch.ones_like(f0)
+
+        f0 = f0.squeeze(0)
+        periodicity = periodicity.squeeze(0)
+        mask = periodicity >= confidence_threshold
+        if not bool(mask.any()):
+            start_sample = end_sample
+            continue
+
+        t = torch.arange(f0.shape[0], device=f0.device, dtype=torch.float32)
+        t = t * hop_length / float(sr)
+        t = t + (start_sample / float(sr))
 
         t_keep = t[mask]
         f_keep = f0[mask]
-
-        # Lissage
         f_smooth = smooth_frequencies(f_keep, window_size=smooth_window)
 
-        # Groupage frames → notes
+        t_np = t_keep.detach().cpu().numpy()
+        f_np = f_smooth.detach().cpu().numpy()
+
         groups = group_frames_to_notes(
-            times=t_keep,
-            freqs=f_smooth,
+            times=t_np,
+            freqs=f_np,
             pitch_tol=pitch_tol,
             max_gap=max_gap,
-            min_note_length=min_note_length
+            min_note_length=min_note_length,
         )
 
-        # Notes + vélocité (amplitude locale)
         for (start_t, end_t, midi_pitch) in groups:
             s_idx = max(0, int(math.floor(start_t * sr)))
-            e_idx = min(len(audio), int(math.ceil(end_t * sr)))
-            seg = audio[s_idx:e_idx] if e_idx > s_idx else audio[s_idx:s_idx+1]
+            e_idx = min(total_len, int(math.ceil(end_t * sr)))
+            if e_idx <= s_idx:
+                e_idx = min(total_len, s_idx + 1)
+            seg = audio_tensor[s_idx:e_idx]
             vel = velocity_from_amplitude(seg)
-            notes_all.append(safe_note(velocity=vel, pitch=int(midi_pitch),
-                                       start=float(start_t), end=float(end_t)))
+            notes_all.append(
+                safe_note(
+                    velocity=vel,
+                    pitch=int(midi_pitch),
+                    start=float(start_t),
+                    end=float(end_t),
+                )
+            )
 
-        start_sample += chunk_size_samples
+        start_sample = end_sample
 
     return notes_all
-# Pour compatibilité avec l’ancien code qui appelait "chunk_crepe"
+
+
+
+def compute_spectrogram_features(y, sr: int, device: str | torch.device | None = None) -> Dict[str, torch.Tensor]:
+    """Compute a reusable STFT representation plus helpful frequency masks."""
+    if device is None:
+        device = torch.device(DEVICE)
+    else:
+        device = torch.device(device)
+    if torch.is_tensor(y):
+        waveform = y.detach().to(device=device, dtype=torch.float32)
+    else:
+        waveform = torch.as_tensor(y, dtype=torch.float32, device=device)
+    if waveform.ndim > 1:
+        waveform = waveform.mean(dim=0)
+    if waveform.numel() == 0:
+        raise ValueError("Empty waveform provided to compute_spectrogram_features")
+
+    window = torch.hann_window(1024, device=device)
+    stft = torch.stft(
+        waveform,
+        n_fft=1024,
+        hop_length=128,
+        window=window,
+        center=True,
+        return_complex=True,
+    )
+    magnitude = stft.abs()
+    power = magnitude.pow(2)
+
+    mag_np = magnitude.detach().cpu().numpy()
+    try:
+        _, percussive = librosa.decompose.hpss(mag_np, kernel_size=(31, 31))
+        percussive_power = torch.from_numpy((percussive ** 2).astype(np.float32)).to(device)
+    except Exception:
+        percussive_power = power.clone()
+
+    freqs = torch.from_numpy(np.fft.rfftfreq(1024, d=1.0 / sr).astype(np.float32)).to(device)
+    band_masks = {
+        "sub": (freqs >= 20.0) & (freqs < 120.0),
+        "mid": (freqs >= 90.0) & (freqs < 200.0),
+        "hi": (freqs >= 2000.0) & (freqs <= 8000.0),
+        "snare_broad": (freqs >= 400.0) & (freqs <= 5000.0),
+        "tom_low": (freqs >= 110.0) & (freqs < 180.0),
+        "tom_mid": (freqs >= 180.0) & (freqs < 260.0),
+        "tom_high": (freqs >= 260.0) & (freqs < 400.0),
+    }
+    time_axis = torch.arange(power.shape[1], device=device, dtype=power.dtype) * (128.0 / sr)
+    return {
+        "power": power,
+        "percussive_power": percussive_power,
+        "freqs": freqs,
+        "hop_length": 128,
+        "sr": sr,
+        "band_masks": band_masks,
+        "time_axis": time_axis,
+        "device": torch.device(device),
+    }
+
+
+def detect_double_kick_subband(y, sr: int, min_distance_ms: float = 6.0) -> List[float]:
+    """Detect additional kick onsets in the 20-120 Hz band."""
+    if torch.is_tensor(y):
+        y_np = y.detach().cpu().numpy()
+    else:
+        y_np = np.asarray(y, dtype=np.float32)
+    if y_np.ndim > 1:
+        y_np = y_np.mean(axis=0)
+    if y_np.size == 0:
+        return []
+
+    sub = butter_band(y_np, sr, 20, 120, btype="band")
+    window = max(1, int(sr * 0.006))
+    env = np.abs(sub)
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    env = np.convolve(env, kernel, mode="same")
+    median = np.median(env)
+    mad = np.median(np.abs(env - median))
+    threshold = median + 1.5 * (mad if mad > 1e-9 else 0.0)
+    min_distance = max(1, int(sr * (min_distance_ms / 1000.0)))
+    peaks, _ = sig.find_peaks(env, height=threshold, distance=min_distance)
+    return (peaks / sr).tolist()
+
+
+def classify_drum_hits_metal(audio,
+                             sr: int,
+                             onset_times: Sequence[float],
+                             features: Dict[str, torch.Tensor],
+                             config: Dict) -> Tuple[List[str], List[int]]:
+    """Vectorised drum-hit classification using precomputed spectrogram features."""
+    onset_times = list(onset_times)
+    if len(onset_times) == 0:
+        return [], []
+
+    device = features.get("device", torch.device(DEVICE))
+    hop_length = features["hop_length"]
+    sr_float = float(sr)
+
+    if torch.is_tensor(audio):
+        audio_tensor = audio.detach().to(device=device, dtype=torch.float32)
+    else:
+        audio_tensor = torch.as_tensor(audio, dtype=torch.float32, device=device)
+    if audio_tensor.ndim > 1:
+        audio_tensor = audio_tensor.mean(dim=0)
+
+    percussive_power = features["percussive_power"]
+    power_device = percussive_power.device
+    if power_device != device:
+        percussive_power = percussive_power.to(device)
+        features = {**features, "percussive_power": percussive_power}
+        device = percussive_power.device
+    total_per_frame = torch.clamp(percussive_power.sum(dim=0), min=1e-9)
+
+    band_masks = features["band_masks"]
+    def band_sum(mask: torch.Tensor) -> torch.Tensor:
+        if mask.any():
+            return torch.sum(percussive_power[mask], dim=0)
+        return torch.zeros_like(total_per_frame)
+
+    sub_energy = band_sum(band_masks.get("sub", torch.zeros_like(features["freqs"], dtype=torch.bool)))
+    mid_energy = band_sum(band_masks.get("mid", torch.zeros_like(features["freqs"], dtype=torch.bool)))
+    hi_energy = band_sum(band_masks.get("hi", torch.zeros_like(features["freqs"], dtype=torch.bool)))
+    snare_energy = band_sum(band_masks.get("snare_broad", torch.zeros_like(features["freqs"], dtype=torch.bool)))
+
+    freqs = features["freqs"].to(device)
+    framewise_centroid = torch.sum(percussive_power.transpose(0, 1) * freqs, dim=1) / total_per_frame
+    peak_indices = torch.argmax(percussive_power, dim=0)
+    framewise_peak = freqs[peak_indices]
+
+    def cumulative(arr: torch.Tensor) -> torch.Tensor:
+        return torch.cumsum(torch.cat([arr.new_zeros(1), arr], dim=0), dim=0)
+
+    total_cumsum = cumulative(total_per_frame)
+    sub_cumsum = cumulative(sub_energy)
+    mid_cumsum = cumulative(mid_energy)
+    hi_cumsum = cumulative(hi_energy)
+    snare_cumsum = cumulative(snare_energy)
+    centroid_cumsum = cumulative(framewise_centroid)
+    peak_cumsum = cumulative(framewise_peak)
+
+    onset_times_t = torch.as_tensor(onset_times, dtype=torch.float32, device=device)
+    num_onsets = onset_times_t.numel()
+    frame_idx = torch.clamp((onset_times_t * sr_float / hop_length).floor().long(), min=0, max=percussive_power.shape[1] - 1)
+    audio_duration = audio_tensor.shape[0] / sr_float
+    next_times = torch.cat([onset_times_t[1:], onset_times_t[-1:].clone() + torch.tensor(config["drum_classification"].get("long_window", 0.3), device=device)])
+    next_times = torch.clamp(next_times, max=audio_duration)
+    available_times = torch.clamp(next_times - onset_times_t - 0.003, min=config["drum_classification"].get("short_window", 0.04))
+    available_frames = torch.clamp((available_times * sr_float / hop_length).round().long(), min=1)
+
+    short_window = config["drum_classification"].get("short_window", 0.04)
+    long_window = config["drum_classification"].get("long_window", 0.3)
+    short_frames = torch.tensor(max(1, int(round(short_window * sr_float / hop_length))), device=device, dtype=torch.long)
+    long_frames = torch.tensor(max(1, int(round(long_window * sr_float / hop_length))), device=device, dtype=torch.long)
+    short_frames_actual = torch.minimum(short_frames.expand_as(available_frames), available_frames)
+    long_frames_actual = torch.minimum(long_frames.expand_as(available_frames), available_frames)
+
+    short_end = torch.clamp(frame_idx + short_frames_actual, max=percussive_power.shape[1])
+    long_end = torch.clamp(frame_idx + long_frames_actual, max=percussive_power.shape[1])
+
+    def segment_sum(cumsum: torch.Tensor, end_indices: torch.Tensor) -> torch.Tensor:
+        return cumsum[end_indices] - cumsum[frame_idx]
+
+    total_short = torch.clamp(segment_sum(total_cumsum, short_end), min=1e-9)
+    sub_short = segment_sum(sub_cumsum, short_end)
+    hi_short = segment_sum(hi_cumsum, short_end)
+    sub_ratio_short = sub_short / total_short
+    hi_ratio_short = hi_short / total_short
+
+    kick_long_ratio = config["drum_classification"].get("kick_long_window_ratio", 0.25)
+    use_long = sub_ratio_short > kick_long_ratio
+    end_indices = torch.where(use_long, long_end, short_end)
+    frames_count = torch.clamp(end_indices - frame_idx, min=1)
+
+    total_final = torch.clamp(segment_sum(total_cumsum, end_indices), min=1e-9)
+    sub_final = segment_sum(sub_cumsum, end_indices)
+    mid_final = segment_sum(mid_cumsum, end_indices)
+    hi_final = segment_sum(hi_cumsum, end_indices)
+    snare_final = segment_sum(snare_cumsum, end_indices)
+
+    sub_ratio = sub_final / total_final
+    mid_ratio = mid_final / total_final
+    hi_ratio = hi_final / total_final
+    snare_ratio = snare_final / total_final
+
+    centroid = segment_sum(centroid_cumsum, end_indices) / frames_count.to(centroid_cumsum.dtype)
+    peak_freq = segment_sum(peak_cumsum, end_indices) / frames_count.to(peak_cumsum.dtype)
+
+    total_long = torch.clamp(segment_sum(total_cumsum, long_end), min=1e-9)
+    hi_long = segment_sum(hi_cumsum, long_end)
+    hi_ratio_long = hi_long / total_long
+    hi_gain = hi_ratio_long - hi_ratio
+
+    labels = torch.full((num_onsets,), fill_value=-1, dtype=torch.int64, device=device)
+    cfg = config.get("drum_classification", {})
+
+    label_ids = {
+        "kick": 0,
+        "snare": 1,
+        "hihat": 2,
+        "hihat_open": 3,
+        "crash1": 4,
+        "crash2": 5,
+        "floor": 6,
+        "tom2": 7,
+        "tom1": 8,
+    }
+    label_names = ["kick", "snare", "hihat", "hihat_open", "crash1", "crash2", "floor", "tom2", "tom1"]
+
+    def assign(mask: torch.Tensor, key: str) -> None:
+        if key not in label_ids:
+            return
+        if mask.numel() == 0:
+            return
+        valid = mask & (labels == -1)
+        labels[valid] = label_ids[key]
+
+    kick_mask = (sub_ratio >= cfg.get("kick_sub_ratio", 0.28)) & (centroid < cfg.get("kick_centroid_max", 900.0)) & (peak_freq < cfg.get("kick_peak_max", 150.0))
+    assign(kick_mask, "kick")
+
+    snare_mask = (mid_ratio >= cfg.get("snare_mid_ratio", 0.18)) & (snare_ratio >= cfg.get("snare_broad_ratio", 0.45)) & (centroid >= cfg.get("snare_centroid_min", 900.0)) & (centroid <= cfg.get("snare_centroid_max", 3500.0))
+    assign(snare_mask, "snare")
+
+    crash_hi_base = cfg.get("crash_hi_ratio", 0.25)
+    cymbal_db = cfg.get("cymbal_score_threshold")
+    if cymbal_db is not None:
+        crash_hi_base += max(0.0, (-cymbal_db - 40.0) / 200.0)
+    crash_mask = (hi_ratio >= crash_hi_base) & (centroid >= cfg.get("crash_centroid_min", 5000.0))
+    assign(crash_mask & (centroid > cfg.get("crash_split_centroid", 6500.0)), "crash2")
+    assign(crash_mask & (centroid <= cfg.get("crash_split_centroid", 6500.0)), "crash1")
+
+    hihat_mask = (hi_ratio >= cfg.get("hihat_hi_ratio", 0.30)) & (centroid >= cfg.get("hihat_centroid_min", 3500.0))
+    assign(hihat_mask & (hi_gain > cfg.get("hihat_open_gain", 0.05)), "hihat_open")
+    assign(hihat_mask, "hihat")
+
+    floor_mask = (peak_freq >= 110.0) & (peak_freq < 180.0) & (sub_ratio >= cfg.get("floor_sub_ratio", 0.18))
+    assign(floor_mask, "floor")
+
+    tom2_mask = (peak_freq >= 180.0) & (peak_freq < 260.0)
+    assign(tom2_mask, "tom2")
+
+    tom1_mask = (peak_freq >= 260.0) & (peak_freq < 400.0)
+    assign(tom1_mask, "tom1")
+
+    start_samples = torch.clamp((onset_times_t * sr_float).floor().long(), min=0, max=audio_tensor.shape[0] - 1)
+    window_samples = torch.clamp((frames_count * hop_length).long(), min=1)
+    end_samples = torch.clamp(start_samples + window_samples, max=audio_tensor.shape[0])
+    max_window = int(window_samples.max().item())
+    sample_offsets = torch.arange(max_window, device=device)
+    sample_indices = start_samples.unsqueeze(1) + sample_offsets.unsqueeze(0)
+    mask_samples = sample_indices < end_samples.unsqueeze(1)
+    sample_indices = torch.clamp(sample_indices, max=audio_tensor.shape[0] - 1)
+    segments = audio_tensor[sample_indices]
+    mask_f = mask_samples.to(segments.dtype)
+    peak_amp = torch.max(torch.abs(segments) * mask_f, dim=1)[0]
+    sum_sq = torch.sum((segments ** 2) * mask_f, dim=1)
+    counts = mask_samples.sum(dim=1).clamp(min=1)
+    rms = torch.sqrt(sum_sq / counts.to(segments.dtype))
+    combined = 0.7 * peak_amp + 0.3 * rms
+    velocities = torch.clamp(torch.round(combined * cfg.get("velocity_scale", 320.0)), min=30.0, max=127.0).to(torch.int64)
+
+    label_list = []
+    for value in labels.cpu().tolist():
+        if value >= 0:
+            label_list.append(label_names[value])
+        else:
+            label_list.append("unknown")
+    velocity_list = [int(v) for v in velocities.cpu().tolist()]
+    return label_list, velocity_list
+
+
 chunk_crepe = chunk_torchcrepe
 
 
@@ -504,14 +841,65 @@ def detect_time_signature(audio_mono: np.ndarray, sr: int, bpm: float) -> int:
     return beats_per_bar or 4
 
 
-def butter_band(y, sr, fmin, fmax, order=4, btype='band'):
+def butter_band(
+    y: np.ndarray,
+    sr: int,
+    fmin: float,
+    fmax: float | None = None,
+    order: int = 4,
+    btype: str = "band",          # "band"/"bandpass", "high"/"highpass", "low"/"lowpass"
+    zero_phase: bool = True       # filtfilt pour éviter le déphasage
+) -> np.ndarray:
+    """
+    Filtre passe-bande / passe-haut / passe-bas Butterworth.
+    - Supporte mono (T,) ou multi-canal (..., T) en filtrant sur l'axe temps (-1).
+    - Normalise correctement les fréquences et vérifie les bornes.
+    """
+    y = np.asarray(y)
+    if y.size == 0:
+        return y
+
     ny = 0.5 * sr
-    if btype == 'band':
-        lo, hi = fmin/ny, fmax/ny
-        b, a = sig.butter(order, [lo, hi], btype='band')
-    else:                       # 'high'
-        b, a = sig.butter(order, fmin/ny, btype='high')
-    return sig.lfilter(b, a, y)
+
+    # normalisation des fréquences coupures (en [0, 1))
+    def _clip01(x: float) -> float:
+        return float(np.clip(x, 1e-6, 0.999999))
+
+    # Harmonise les alias de btype vers ceux attendus par SciPy
+    btype_norm = {
+        "band": "bandpass",
+        "bandpass": "bandpass",
+        "high": "highpass",
+        "highpass": "highpass",
+        "low": "lowpass",
+        "lowpass": "lowpass",
+    }.get(btype.lower())
+    if btype_norm is None:
+        raise ValueError(f"btype inconnu: {btype}. Utilise 'band', 'high', ou 'low'.")
+
+    if btype_norm == "bandpass":
+        if fmax is None:
+            raise ValueError("Pour un passe-bande, fmax est requis.")
+        lo = _clip01(fmin / ny)
+        hi = _clip01(fmax / ny)
+        if not (hi > lo):
+            raise ValueError(f"Bornes invalides: fmin={fmin}Hz, fmax={fmax}Hz (nyquist={ny}Hz).")
+        sos = sig.butter(order, [lo, hi], btype="bandpass", output="sos")
+    elif btype_norm == "highpass":
+        w = _clip01(fmin / ny)
+        sos = sig.butter(order, w, btype="highpass", output="sos")
+    else:  # lowpass
+        w = _clip01(fmin / ny)
+        sos = sig.butter(order, w, btype="lowpass", output="sos")
+
+    # Filtrage zero-phase (évite le déphasage). Sinon, sosfilt (causal).
+    if zero_phase:
+        y_filt = sig.sosfiltfilt(sos, y, axis=-1)
+    else:
+        y_filt = sig.sosfilt(sos, y, axis=-1)
+
+    return y_filt
+
 
 
 # ======================================================================
